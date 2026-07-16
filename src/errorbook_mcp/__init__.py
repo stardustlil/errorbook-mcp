@@ -1,0 +1,1 @@
+"""Errorbook MCP server."""

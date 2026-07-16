@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "errorbook-mcp"
+version = "0.1.0"
+description = "A production-ready MCP server for recording, scheduling, and exporting an error notebook."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "stardustlil and contributors" }]
+keywords = [
+  "education",
+  "error-book",
+  "fsrs",
+  "mcp",
+  "model-context-protocol",
+  "spaced-repetition",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Education",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Education",
+]
+dependencies = [
+  "fsrs==6.3.1",
+  "latex2mathml>=3.77,<4",
+  "markdown-it-py>=3.0,<5",
+  "mdit-py-plugins>=0.5,<1",
+  "mcp>=1.23,<2",
+  "pypdf>=6.0,<7",
+  "pydantic>=2.10,<3",
+  "tzdata>=2025.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pdfplumber>=0.11,<1",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+errorbook-mcp = "errorbook_mcp.server:main"
+
+[project.urls]
+Changelog = "https://github.com/stardustlil/errorbook-mcp/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/stardustlil/errorbook-mcp#readme"
+Issues = "https://github.com/stardustlil/errorbook-mcp/issues"
+Repository = "https://github.com/stardustlil/errorbook-mcp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/errorbook_mcp"]
+
+[tool.hatch.build]
+exclude = [
+  "/.pytest_cache",
+  "/.ruff_cache",
+  "/.uv-cache*",
+  "/.venv",
+  "/dist",
+  "/output",
+  "/tmp",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q --basetemp=tmp/pytest"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501", "SIM108"]
