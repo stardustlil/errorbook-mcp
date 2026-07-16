@@ -10,6 +10,7 @@ All notable changes to this project are documented in this file. The format foll
 
 - Test runs now create their temporary directory successfully from a clean checkout.
 - Dependabot now updates `pyproject.toml` and `uv.lock` together.
+- CI uses the current Node 24-based GitHub Actions releases.
 
 ## [0.1.0] - 2026-07-16
 
