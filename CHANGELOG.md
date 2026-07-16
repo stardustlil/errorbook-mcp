@@ -9,6 +9,7 @@ All notable changes to this project are documented in this file. The format foll
 ### Fixed
 
 - Test runs now create their temporary directory successfully from a clean checkout.
+- Dependabot now updates `pyproject.toml` and `uv.lock` together.
 
 ## [0.1.0] - 2026-07-16
 
