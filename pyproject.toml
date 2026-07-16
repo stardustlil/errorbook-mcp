@@ -73,7 +73,7 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "-q --basetemp=tmp/pytest"
+addopts = "-q --basetemp=.pytest-tmp"
 testpaths = ["tests"]
 
 [tool.ruff]

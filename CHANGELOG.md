@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- Test runs now create their temporary directory successfully from a clean checkout.
+
 ## [0.1.0] - 2026-07-16
 
 ### Added
