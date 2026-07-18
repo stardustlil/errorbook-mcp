@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Fixed
 
+- Export lease recovery now isolates concurrent render outputs so a stale worker cannot overwrite
+  the current PDF, and export deletion restores files when its database transaction rolls back.
+- Review text inputs are bounded, review timestamps cannot predate problem creation, and large
+  searches or review selections no longer load every matching problem body into memory.
+- Streamable HTTP, configuration, validation, rollback, path-integrity, and concurrency test
+  coverage was expanded, and the development test toolchain no longer uses a vulnerable pytest.
 - Test runs now create their temporary directory successfully from a clean checkout.
 - Dependabot now updates `pyproject.toml` and `uv.lock` together.
 - CI uses the current Node 24-based GitHub Actions releases.

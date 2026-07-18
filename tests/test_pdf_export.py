@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from threading import Event
 
 import pytest
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
-from errorbook_mcp.errors import ExportError, NotFoundError
-from errorbook_mcp.pdf_export import PdfExporter, SafeMarkdownRenderer
+from errorbook_mcp.errors import ExportError, NotFoundError, ValidationError
+from errorbook_mcp.pdf_export import PdfExporter, SafeMarkdownRenderer, _sha256
 from errorbook_mcp.scheduler import iso_utc, utc_now
 from errorbook_mcp.schemas import ProblemPatch, ReviewSheetRequest
 from errorbook_mcp.service import ErrorbookService
@@ -177,6 +181,65 @@ def test_generating_export_uses_lease_and_recovers(
     assert "last_selected_at" not in service.get_problem(number)["problem"]
 
 
+def test_stale_renderer_cannot_overwrite_recovered_export(
+    service: ErrorbookService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = service.create_problem(choice_problem(), idempotency_key="race-create-001")
+    request = ReviewSheetRequest(mode="numbers", numbers=[created["problem"]["number"]])
+    stale_exporter = PdfExporter(service)
+    current_exporter = PdfExporter(service)
+    stale_started = Event()
+    release_stale = Event()
+    stale_path: list[Path] = []
+
+    def render_result(exporter: PdfExporter, export_id: str, lease_token: str, body: bytes):
+        relative_path = f"exports/{export_id}-{lease_token}-questions.pdf"
+        path = service.settings.data_dir / relative_path
+        path.write_bytes(body)
+        return {
+            "questions": exporter._file_descriptor(
+                export_id, "questions", relative_path, _sha256(path)
+            )
+        }
+
+    def render_stale(*, export_id: str, lease_token: str, **_: object):
+        stale_started.set()
+        assert release_stale.wait(timeout=10)
+        result = render_result(stale_exporter, export_id, lease_token, b"stale-pdf")
+        stale_path.append(Path(result["questions"]["local_path"]))
+        return result
+
+    def render_current(*, export_id: str, lease_token: str, **_: object):
+        return render_result(current_exporter, export_id, lease_token, b"current-pdf")
+
+    monkeypatch.setattr(stale_exporter, "_render_export", render_stale)
+    monkeypatch.setattr(current_exporter, "_render_export", render_current)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        stale_future = executor.submit(
+            stale_exporter.create_review_sheet,
+            request,
+            idempotency_key="race-export-001",
+        )
+        assert stale_started.wait(timeout=10)
+        with service.db.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE exports SET lease_expires_at = ?",
+                (iso_utc(utc_now() - timedelta(seconds=1)),),
+            )
+        current = current_exporter.create_review_sheet(request, idempotency_key="race-export-001")
+        release_stale.set()
+        stale = stale_future.result(timeout=10)
+
+    current_path = Path(current["questions"]["local_path"])
+    assert stale["export_id"] == current["export_id"]
+    assert current_path.read_bytes() == b"current-pdf"
+    assert current_exporter.read_export(current["export_id"], "questions") == b"current-pdf"
+    assert stale_path and not stale_path[0].exists()
+    assert list(service.settings.exports_dir.glob(f"{current['export_id']}-*-questions.pdf")) == [
+        current_path
+    ]
+
+
 def test_pdf_renderer_has_no_cross_request_formula_counter(service: ErrorbookService) -> None:
     exporter = PdfExporter(service)
     formula_text = " ".join(f"$x_{{{index}}}$" for index in range(150))
@@ -228,3 +291,140 @@ def test_export_files_can_be_listed_and_deleted(
     assert not path.exists()
     with pytest.raises(NotFoundError):
         exporter.get_export(result["export_id"])
+
+
+def test_delete_export_restores_file_when_transaction_rolls_back(
+    service: ErrorbookService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = service.create_problem(choice_problem(), idempotency_key="rollback-create-001")
+    exporter = PdfExporter(service)
+
+    def fake_pdf(document: str, target: Path, job_name: str) -> None:
+        del document, job_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"%PDF-1.7\n" + b"x" * 2_000)
+
+    monkeypatch.setattr(exporter, "_html_to_pdf", fake_pdf)
+    result = exporter.create_review_sheet(
+        ReviewSheetRequest(mode="numbers", numbers=[created["problem"]["number"]]),
+        idempotency_key="rollback-export-001",
+    )
+    path = Path(result["questions"]["local_path"])
+    original_transaction = service.db.transaction
+
+    @contextmanager
+    def failing_transaction(*, immediate: bool = False):
+        with original_transaction(immediate=immediate) as connection:
+            yield connection
+            if immediate:
+                raise sqlite3.OperationalError("forced commit failure")
+
+    monkeypatch.setattr(service.db, "transaction", failing_transaction)
+    with pytest.raises(sqlite3.OperationalError, match="forced commit failure"):
+        exporter.delete_export(result["export_id"])
+
+    assert path.is_file()
+    assert service.db.fetch_one("SELECT id FROM exports WHERE id = ?", (result["export_id"],))
+    assert not list(service.settings.temp_dir.glob("delete-*.pdf"))
+
+
+def test_stored_export_path_cannot_escape_exports_directory(
+    service: ErrorbookService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = service.create_problem(choice_problem(), idempotency_key="escape-create-001")
+    exporter = PdfExporter(service)
+
+    def fake_pdf(document: str, target: Path, job_name: str) -> None:
+        del document, job_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"%PDF-1.7\n" + b"x" * 2_000)
+
+    monkeypatch.setattr(exporter, "_html_to_pdf", fake_pdf)
+    result = exporter.create_review_sheet(
+        ReviewSheetRequest(mode="numbers", numbers=[created["problem"]["number"]]),
+        idempotency_key="escape-export-001",
+    )
+    with service.db.transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE exports SET questions_path = '../outside.pdf' WHERE id = ?",
+            (result["export_id"],),
+        )
+
+    with pytest.raises(ExportError, match="outside the exports directory"):
+        exporter.get_export(result["export_id"])
+
+
+def test_export_api_rejects_invalid_missing_and_generating_requests(
+    service: ErrorbookService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exporter = PdfExporter(service)
+    with pytest.raises(ValidationError, match="limit"):
+        exporter.list_exports(limit=0)
+    with pytest.raises(ValidationError, match="offset"):
+        exporter.list_exports(offset=-1)
+    with pytest.raises(NotFoundError):
+        exporter.get_export("missing-export")
+    with pytest.raises(ValidationError, match="questions booklet"):
+        exporter.read_export("missing-export", "answers")
+    with pytest.raises(NotFoundError):
+        exporter.read_export("missing-export", "questions")
+
+    created = service.create_problem(choice_problem(), idempotency_key="api-create-001")
+
+    def interrupt(**_: object) -> dict[str, object]:
+        raise SystemExit(9)
+
+    monkeypatch.setattr(exporter, "_render_export", interrupt)
+    with pytest.raises(SystemExit):
+        exporter.create_review_sheet(
+            ReviewSheetRequest(mode="numbers", numbers=[created["problem"]["number"]]),
+            idempotency_key="api-export-001",
+        )
+    row = service.db.fetch_one("SELECT id FROM exports")
+    assert row is not None
+    status = exporter.get_export(row["id"])
+    assert status["status"] == "generating"
+    assert status["lease_expires_at"]
+    listed = exporter.list_exports()
+    assert listed["items"][0]["questions"]["exists"] is False
+    with pytest.raises(ValidationError, match="generating"):
+        exporter.delete_export(row["id"])
+    with pytest.raises(NotFoundError, match="not available"):
+        exporter.read_export(row["id"], "questions")
+
+
+def test_pdf_validation_and_renderer_availability(
+    service: ErrorbookService, tmp_path: Path
+) -> None:
+    exporter = PdfExporter(service)
+    small = tmp_path / "small.pdf"
+    small.write_bytes(b"%PDF")
+    with pytest.raises(ExportError, match="unexpectedly small"):
+        exporter._validate_pdf(small)
+
+    invalid = tmp_path / "invalid.pdf"
+    invalid.write_bytes(b"not a pdf" + b"x" * 2_000)
+    with pytest.raises(ExportError, match="could not be validated"):
+        exporter._validate_pdf(invalid)
+
+    non_a4 = tmp_path / "non-a4.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    writer.add_metadata({"/Padding": "x" * 2_000})
+    with non_a4.open("wb") as output:
+        writer.write(output)
+    with pytest.raises(ExportError, match="not A4"):
+        exporter._validate_pdf(non_a4)
+
+    unavailable = PdfExporter(ErrorbookService(replace(service.settings, browser_path=None)))
+    with pytest.raises(ExportError, match="No Chromium-based browser"):
+        unavailable._html_to_pdf("<html></html>", tmp_path / "output.pdf", "missing")
+
+
+def test_abandoned_render_files_are_removed(service: ErrorbookService) -> None:
+    exporter = PdfExporter(service)
+    abandoned = service.settings.exports_dir / "export-id-old-questions.pdf"
+    abandoned.write_bytes(b"old")
+    exporter._cleanup_abandoned_render_files("export-id")
+    assert not abandoned.exists()
+    exporter._discard_render_result({})

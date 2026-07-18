@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
 
 def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
     raw = os.getenv(name)
@@ -74,6 +76,10 @@ class Settings:
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"Unknown ERRORBOOK_TIMEZONE: {timezone_name}") from exc
 
+        log_level = os.getenv("ERRORBOOK_LOG_LEVEL", "INFO").upper()
+        if log_level not in VALID_LOG_LEVELS:
+            raise ValueError("ERRORBOOK_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+
         settings = cls(
             data_dir=data_dir,
             timezone=timezone,
@@ -83,7 +89,7 @@ class Settings:
                 "ERRORBOOK_PDF_FONT",
                 '"Microsoft YaHei", "Noto Sans CJK SC", "PingFang SC", sans-serif',
             ),
-            log_level=os.getenv("ERRORBOOK_LOG_LEVEL", "INFO").upper(),
+            log_level=log_level,
         )
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         settings.exports_dir.mkdir(parents=True, exist_ok=True)
