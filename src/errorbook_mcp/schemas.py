@@ -110,7 +110,9 @@ class ReviewSheetRequest(StrictModel):
 
 def _validate_math_delimiters(text: str) -> None:
     # Accept the TeX delimiters commonly produced by OCR and PDF copy/paste.
-    text = re.sub(r"\\\[(.*?)\\\]", lambda match: f"$$\n{match.group(1)}\n$$", text, flags=re.DOTALL)
+    text = re.sub(
+        r"\\\[(.*?)\\\]", lambda match: f"$$\n{match.group(1)}\n$$", text, flags=re.DOTALL
+    )
     text = re.sub(r"\\\((.*?)\\\)", lambda match: f"${match.group(1)}$", text, flags=re.DOTALL)
     visible_lines: list[str] = []
     fence_character: str | None = None

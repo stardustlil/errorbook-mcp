@@ -86,14 +86,19 @@ EXPORT_LEASE_DURATION = timedelta(minutes=5)
 
 def _normalize_math_delimiters(text: str) -> str:
     """Normalize TeX delimiters commonly emitted by OCR into dollar math."""
-    text = re.sub(r"\\\[(.*?)\\\]", lambda match: f"$$\n{match.group(1)}\n$$", text, flags=re.DOTALL)
+    text = re.sub(
+        r"\\\[(.*?)\\\]", lambda match: f"$$\n{match.group(1)}\n$$", text, flags=re.DOTALL
+    )
     return re.sub(r"\\\((.*?)\\\)", lambda match: f"${match.group(1)}$", text, flags=re.DOTALL)
 
 
 def _validate_formula_markup(text: str, *, context: str) -> None:
     """Reject common TeX that was left in prose instead of marked as math."""
     prose = re.sub(r"\$\$.*?\$\$|\$[^$\n]+\$", "", text, flags=re.DOTALL)
-    if re.search(r"\\(?:frac|dfrac|tfrac|sqrt|sum|prod|int|iint|oint|lim|cdot|times|leq?|geq?|neq|pm|mid|begin|end)\b", prose):
+    if re.search(
+        r"\\(?:frac|dfrac|tfrac|sqrt|sum|prod|int|iint|oint|lim|cdot|times|leq?|geq?|neq|pm|mid|begin|end)\b",
+        prose,
+    ):
         raise ExportError(
             f"LaTeX command must be enclosed in math delimiters in {context}",
             details={"context": context},
@@ -626,7 +631,8 @@ class PdfExporter:
 
     def delete_export(self, export_id: str) -> dict[str, Any]:
         row = self.service.db.fetch_one(
-            "SELECT id, review_set_id, status, questions_path FROM exports WHERE id = ?", (export_id,)
+            "SELECT id, review_set_id, status, questions_path FROM exports WHERE id = ?",
+            (export_id,),
         )
         if row is None:
             raise NotFoundError(f"Export {export_id} was not found")

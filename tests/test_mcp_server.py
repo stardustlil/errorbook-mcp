@@ -27,10 +27,10 @@ def test_mcp_surface_is_registered(settings: Settings) -> None:
         "adjust_priority",
         "set_problem_status",
         "create_review_sheet",
-            "get_export_status",
-            "list_exports",
-            "delete_export",
-            "get_library_stats",
+        "get_export_status",
+        "list_exports",
+        "delete_export",
+        "get_library_stats",
     }
     create = next(tool for tool in tools if tool.name == "create_problem")
     assert {"draft", "idempotency_key"}.issubset(set(create.inputSchema["required"]))
