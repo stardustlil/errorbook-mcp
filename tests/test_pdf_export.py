@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pypdf import PdfReader
 
-from errorbook_mcp.errors import ExportError, ValidationError
+from errorbook_mcp.errors import ExportError, NotFoundError
 from errorbook_mcp.pdf_export import PdfExporter, SafeMarkdownRenderer
 from errorbook_mcp.scheduler import iso_utc, utc_now
 from errorbook_mcp.schemas import ProblemPatch, ReviewSheetRequest
@@ -84,8 +84,6 @@ def test_pdf_export_end_to_end_and_snapshot(service: ErrorbookService) -> None:
     for number in numbers:
         assert number in text
     assert exporter.read_export(result["export_id"], "questions").startswith(b"%PDF")
-    with pytest.raises(ValidationError):
-        exporter.read_export(result["export_id"], "answers")
 
     replay = exporter.create_review_sheet(request, idempotency_key="pdf-export-0001")
     assert replay["export_id"] == result["export_id"]
@@ -130,7 +128,7 @@ def test_pdf_formula_failure_is_persisted(service: ErrorbookService) -> None:
     status = exporter.get_export(result["export_id"])
     assert status["status"] == "failed"
     problem = service.get_problem(created["problem"]["number"])["problem"]
-    assert problem["last_selected_at"] is None
+    assert "last_selected_at" not in problem
 
 
 def test_generating_export_uses_lease_and_recovers(
@@ -149,7 +147,7 @@ def test_generating_export_uses_lease_and_recovers(
         exporter.create_review_sheet(request, idempotency_key="lease-export-001")
     generating = service.db.fetch_one("SELECT * FROM exports")
     assert generating is not None and generating["status"] == "generating"
-    assert service.get_problem(number)["problem"]["last_selected_at"] is None
+    assert "last_selected_at" not in service.get_problem(number)["problem"]
 
     def should_not_run(**_: object) -> dict[str, object]:
         raise AssertionError("an active lease must not be stolen")
@@ -176,7 +174,7 @@ def test_generating_export_uses_lease_and_recovers(
     recovered = exporter.create_review_sheet(request, idempotency_key="lease-export-001")
     assert recovered["status"] == "ready"
     assert recovered["export_id"] == generating["id"]
-    assert service.get_problem(number)["problem"]["last_selected_at"] is not None
+    assert "last_selected_at" not in service.get_problem(number)["problem"]
 
 
 def test_pdf_renderer_has_no_cross_request_formula_counter(service: ErrorbookService) -> None:
@@ -194,8 +192,6 @@ def test_pdf_renderer_has_no_cross_request_formula_counter(service: ErrorbookSer
                     "subject": "数学",
                     "stem_markdown": formula_text,
                     "choices": [],
-                    "answer_markdown": None,
-                    "solution_markdown": None,
                 }
             ],
             generated_at=utc_now(),
@@ -204,3 +200,31 @@ def test_pdf_renderer_has_no_cross_request_formula_counter(service: ErrorbookSer
     with ThreadPoolExecutor(max_workers=2) as executor:
         outputs = list(executor.map(render, ["EB-2026-000001", "EB-2026-000002"]))
     assert all(output.count("<math") == 150 for output in outputs)
+
+
+def test_export_files_can_be_listed_and_deleted(
+    service: ErrorbookService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = service.create_problem(choice_problem(), idempotency_key="files-create-001")
+    exporter = PdfExporter(service)
+
+    def fake_pdf(document: str, target: Path, job_name: str) -> None:
+        del document, job_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"%PDF-1.7\n" + b"x" * 2_000)
+
+    monkeypatch.setattr(exporter, "_html_to_pdf", fake_pdf)
+    result = exporter.create_review_sheet(
+        ReviewSheetRequest(mode="numbers", numbers=[created["problem"]["number"]]),
+        idempotency_key="files-export-001",
+    )
+    path = Path(result["questions"]["local_path"])
+    listed = exporter.list_exports()
+    assert listed["items"][0]["export_id"] == result["export_id"]
+    assert listed["items"][0]["questions"]["exists"] is True
+
+    deleted = exporter.delete_export(result["export_id"])
+    assert deleted["status"] == "deleted"
+    assert not path.exists()
+    with pytest.raises(NotFoundError):
+        exporter.get_export(result["export_id"])

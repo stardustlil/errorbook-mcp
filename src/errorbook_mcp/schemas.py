@@ -34,8 +34,6 @@ class ProblemDraft(StrictModel):
     subject: Annotated[str, StringConstraints(min_length=1, max_length=100)]
     stem_markdown: Annotated[str, StringConstraints(min_length=1, max_length=100_000)]
     choices: list[Choice] = Field(default_factory=list, max_length=20)
-    answer_markdown: Annotated[str, StringConstraints(max_length=50_000)] | None = None
-    solution_markdown: Annotated[str, StringConstraints(max_length=100_000)] | None = None
     source: Annotated[str, StringConstraints(max_length=1_000)] | None = None
     tags: list[Annotated[str, StringConstraints(min_length=1, max_length=50)]] = Field(
         default_factory=list, max_length=30
@@ -55,10 +53,6 @@ class ProblemDraft(StrictModel):
         _validate_math_delimiters(self.stem_markdown)
         for choice in self.choices:
             _validate_math_delimiters(choice.content_markdown)
-        if self.answer_markdown:
-            _validate_math_delimiters(self.answer_markdown)
-        if self.solution_markdown:
-            _validate_math_delimiters(self.solution_markdown)
         return self
 
 
@@ -71,8 +65,6 @@ class ProblemPatch(StrictModel):
         default=None
     )
     choices: list[Choice] = Field(default=None, max_length=20)
-    answer_markdown: Annotated[str, StringConstraints(max_length=50_000)] | None = None
-    solution_markdown: Annotated[str, StringConstraints(max_length=100_000)] | None = None
     source: Annotated[str, StringConstraints(max_length=1_000)] | None = None
     tags: list[Annotated[str, StringConstraints(min_length=1, max_length=50)]] = Field(
         default=None, max_length=30

@@ -138,20 +138,17 @@ class ErrorbookService:
             cursor = connection.execute(
                 """
                 INSERT INTO problems(
-                    kind, subject, stem_markdown, choices_json, answer_markdown,
-                    solution_markdown, source, importance, content_hash,
+                    kind, subject, stem_markdown, choices_json, source, importance, content_hash,
                     fsrs_card_json, due_at, last_reviewed_at, stability, difficulty,
                     attempt_count, lapse_count, wrong_streak, lapse_mass,
                     lapse_mass_updated_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     draft.kind,
                     draft.subject,
                     _normalized_markdown(draft.stem_markdown),
                     json_dumps([choice.model_dump() for choice in draft.choices]),
-                    _normalized_markdown(draft.answer_markdown),
-                    _normalized_markdown(draft.solution_markdown),
                     _normalized_markdown(draft.source),
                     draft.importance,
                     digest,
@@ -342,8 +339,6 @@ class ErrorbookService:
                 "subject": row["subject"],
                 "stem_markdown": row["stem_markdown"],
                 "choices": json.loads(row["choices_json"]),
-                "answer_markdown": row["answer_markdown"],
-                "solution_markdown": row["solution_markdown"],
                 "source": row["source"],
                 "tags": tags,
                 "importance": row["importance"],
@@ -356,7 +351,7 @@ class ErrorbookService:
             connection.execute(
                 """
                 UPDATE problems SET kind = ?, subject = ?, stem_markdown = ?, choices_json = ?,
-                    answer_markdown = ?, solution_markdown = ?, source = ?, importance = ?,
+                    source = ?, importance = ?,
                     content_hash = ?, version = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -365,8 +360,6 @@ class ErrorbookService:
                     validated.subject,
                     _normalized_markdown(validated.stem_markdown),
                     json_dumps([choice.model_dump() for choice in validated.choices]),
-                    _normalized_markdown(validated.answer_markdown),
-                    _normalized_markdown(validated.solution_markdown),
                     _normalized_markdown(validated.source),
                     validated.importance,
                     _content_hash(validated),
@@ -700,21 +693,7 @@ class ErrorbookService:
                 if mode == "scheduled":
                     due = parse_datetime(row["due_at"])
                     manual = problem["priority"]["manual_boost_mass"]
-                    last_selected = (
-                        parse_datetime(row["last_selected_at"]) if row["last_selected_at"] else None
-                    )
-                    reviewed_after_selection = bool(
-                        last_selected
-                        and row["last_reviewed_at"]
-                        and parse_datetime(row["last_reviewed_at"]) > last_selected
-                        and row["wrong_streak"] > 0
-                    )
-                    recently_selected = bool(
-                        last_selected
-                        and (now - last_selected) < timedelta(days=6)
-                        and not reviewed_after_selection
-                    )
-                    if (due > horizon and manual < 0.25) or recently_selected:
+                    if due > horizon and manual < 0.25:
                         continue
                 candidates.append(problem)
 
@@ -726,11 +705,11 @@ class ErrorbookService:
             item
             for item in candidates
             if parse_datetime(item["memory"]["due_at"]) <= now
-            and parse_datetime(item["last_selected_at"] or item["created_at"]) <= fairness_cutoff
+            and parse_datetime(item["created_at"]) <= fairness_cutoff
         ]
         must_include.sort(
             key=lambda item: (
-                item["last_selected_at"] or item["created_at"],
+                item["created_at"],
                 item["memory"]["due_at"],
                 item["number"],
             )
@@ -752,14 +731,6 @@ class ErrorbookService:
         }
         return selected, metadata
 
-    def mark_selected(
-        self, connection: sqlite3.Connection, problem_ids: Iterable[int], now: datetime
-    ) -> None:
-        connection.executemany(
-            "UPDATE problems SET last_selected_at = ? WHERE id = ?",
-            [(iso_utc(now), problem_id) for problem_id in problem_ids],
-        )
-
     def _serialize_problem(
         self,
         connection: sqlite3.Connection,
@@ -772,7 +743,6 @@ class ErrorbookService:
         retrievability = self.memory.retrievability(card, now)
         manual_mass = self._manual_boost_mass(connection, row["id"], now)
         last_reviewed = parse_datetime(row["last_reviewed_at"]) if row["last_reviewed_at"] else None
-        last_selected = parse_datetime(row["last_selected_at"]) if row["last_selected_at"] else None
         score = queue_score(
             now=now,
             due_at=parse_datetime(row["due_at"]),
@@ -783,7 +753,6 @@ class ErrorbookService:
             lapse_mass_updated_at=parse_datetime(row["lapse_mass_updated_at"]),
             manual_boost_mass=manual_mass,
             importance=row["importance"],
-            last_selected_at=last_selected,
             retrievability=retrievability,
         )
         result: dict[str, Any] = {
@@ -793,8 +762,6 @@ class ErrorbookService:
             "subject": row["subject"],
             "stem_markdown": row["stem_markdown"],
             "choices": json.loads(row["choices_json"]),
-            "answer_markdown": row["answer_markdown"],
-            "solution_markdown": row["solution_markdown"],
             "source": row["source"],
             "tags": self._tags_for_problem(connection, row["id"]),
             "importance": row["importance"],
@@ -819,7 +786,6 @@ class ErrorbookService:
                 "reasons": score.reasons,
                 "manual_boost_mass": round(manual_mass, 4),
             },
-            "last_selected_at": row["last_selected_at"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -861,8 +827,6 @@ class ErrorbookService:
             "subject": row["subject"],
             "stem_markdown": row["stem_markdown"],
             "choices": json.loads(row["choices_json"]),
-            "answer_markdown": row["answer_markdown"],
-            "solution_markdown": row["solution_markdown"],
             "source": row["source"],
             "tags": self._tags_for_problem(connection, row["id"]),
             "importance": row["importance"],

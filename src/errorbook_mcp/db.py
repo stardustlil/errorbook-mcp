@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -22,8 +22,6 @@ CREATE TABLE IF NOT EXISTS problems (
     subject TEXT NOT NULL,
     stem_markdown TEXT NOT NULL,
     choices_json TEXT NOT NULL DEFAULT '[]',
-    answer_markdown TEXT,
-    solution_markdown TEXT,
     source TEXT,
     importance REAL NOT NULL DEFAULT 0.5 CHECK (importance >= 0 AND importance <= 1),
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'mastered', 'archived')),
@@ -40,7 +38,6 @@ CREATE TABLE IF NOT EXISTS problems (
     wrong_streak INTEGER NOT NULL DEFAULT 0,
     lapse_mass REAL NOT NULL DEFAULT 0,
     lapse_mass_updated_at TEXT NOT NULL,
-    last_selected_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -131,8 +128,6 @@ CREATE TABLE IF NOT EXISTS exports (
     status TEXT NOT NULL CHECK (status IN ('generating', 'ready', 'failed')),
     questions_path TEXT,
     questions_sha256 TEXT,
-    answers_path TEXT,
-    answers_sha256 TEXT,
     error_message TEXT,
     lease_token TEXT,
     lease_expires_at TEXT,

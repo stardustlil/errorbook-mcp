@@ -25,12 +25,14 @@ Errorbook MCP 是一个可直接接入支持 Model Context Protocol (MCP) 的 ag
 | Tool | `create_problem` | 校验、去重、记录单题并分配固定编号 |
 | Tool | `get_problem` | 按编号读取题目，可选完整复习和优先级历史 |
 | Tool | `search_problems` | 按文本、编号、学科、标签、题型、状态和到期时间组合查询 |
-| Tool | `update_problem` | 使用 `expected_version` 乐观锁修正 OCR 或答案内容 |
+| Tool | `update_problem` | 使用 `expected_version` 乐观锁修正 OCR 或题目内容 |
 | Tool | `record_review` | 追加真实作答结果并更新 FSRS |
 | Tool | `adjust_priority` | 记录用户明确提出的临时优先级调整 |
 | Tool | `set_problem_status` | 在 active、mastered、archived 之间切换，不硬删除历史 |
 | Tool | `create_review_sheet` | 冻结题目快照并生成仅含题目的 A4 错题复习卷 |
 | Tool | `get_export_status` | 查询导出状态、路径、资源 URI、大小和 SHA-256 |
+| Tool | `list_exports` | 列出历史 PDF 文件及其存在状态 |
+| Tool | `delete_export` | 删除指定 PDF 导出，不影响题目调度 |
 | Tool | `get_library_stats` | 查看题库、到期积压和学科分布 |
 | Resource | `errorbook://exports/{export_id}/questions` | 读取 questions PDF 二进制内容 |
 
@@ -62,10 +64,9 @@ score = 42% 到期紧迫度
       + 12% FSRS 难度
       + 10% 人工 boost
       +  8% 用户长期 importance
-      +  6% 距离上次入卷时间
 ```
 
-到期紧迫度在到期点为 0.5，随逾期连续上升并趋近 1；未来到期则连续下降。默认候选仅包含 active 且在未来七天内到期的题，或仍有有效人工 boost 的题。已经成功进入试卷的题冷却 6 天；若入卷后又做错，则立即重新获得资格。已到期且 28 天未入卷的题进入 `fairness_must_include` 必选桶，防止大题库中长期饥饿。返回结果会报告 backlog、必选溢出和按当前卷容量估算的清空周数。
+到期紧迫度在到期点为 0.5，随逾期连续上升并趋近 1；未来到期则连续下降。默认候选仅包含 active 且在未来七天内到期的题，或仍有有效人工 boost 的题。已到期且创建超过 28 天的题进入 `fairness_must_include` 必选桶，防止大题库中长期饥饿。PDF 导出是只读查阅操作，不会改变 FSRS、队列优先级或题目数据。返回结果会报告 backlog、必选溢出和按当前卷容量估算的清空周数。
 
 题库过载时算法不能凭空消除工作量：如果每周新增/到期数量长期高于 `max_questions`，agent 应把返回的 backlog 明确告诉用户，而不是悄悄丢题。
 
@@ -129,7 +130,7 @@ uv run python -m errorbook_mcp
 1. 用户把错题图片上传给具备视觉能力的 agent。
 2. agent 使用 MCP prompt `record_from_image` 的规则，将图片忠实转写成 Markdown；数学公式使用 `$...$` 或 `$$...$$` LaTeX。
 3. agent 调用 `create_problem`。OCR 不清楚的内容不能猜，应先向用户确认。
-4. MCP 校验题型、选项和答案，检查重复内容，并分配固定编号。
+4. MCP 校验题型和选项，检查重复内容，并分配固定编号。
 
 一个题目只保存规范化后的文本；原始图片仍由宿主应用管理。这样不需要在 MCP 中配置第二套视觉模型或上传凭据。
 
@@ -142,7 +143,7 @@ uv run python -m errorbook_mcp
 
 PDF 将原始 Markdown 转为静态 MathML，再由本机 Edge/Chrome/Chromium 打印，不执行 JavaScript 或 TeX 程序。原始 HTML、外部图片、链接和危险 LaTeX 命令会被拒绝。资源读取时会重新核对 SHA-256；文件被替换或损坏时不会静默返回。
 
-导出使用数据库租约。进程在渲染中退出时，原幂等键会先保持 `generating`；租约最多五分钟后，同一请求和同一幂等键可从已冻结的题目快照恢复，不会重新选题。只有问题卷实际生成成功后，题目才会记为“已入卷”。
+导出使用数据库租约。进程在渲染中退出时，原幂等键会先保持 `generating`；租约最多五分钟后，同一请求和同一幂等键可从已冻结的题目快照恢复，不会重新选题。导出成功只会保存 PDF 文件和导出记录，不会写回题目或调度状态。
 
 ## 数据与备份
 

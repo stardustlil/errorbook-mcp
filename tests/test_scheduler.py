@@ -49,7 +49,6 @@ def test_queue_score_is_monotonic_for_overdue_and_boost() -> None:
         lapse_mass=0.0,
         lapse_mass_updated_at=NOW,
         importance=0.5,
-        last_selected_at=None,
         retrievability=0.8,
     )
     future = queue_score(due_at=NOW + timedelta(days=3), manual_boost_mass=0.0, **common)

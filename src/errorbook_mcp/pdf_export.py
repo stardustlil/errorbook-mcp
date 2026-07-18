@@ -380,7 +380,6 @@ class PdfExporter:
                     (review_set_id,),
                 ).fetchall()
                 snapshots = [json.loads(item["snapshot_json"]) for item in stored_items]
-                problem_ids = [item["problem_id"] for item in stored_items]
             else:
                 assert preselected is not None and preselection_meta is not None
                 selected = preselected
@@ -401,7 +400,6 @@ class PdfExporter:
                 lease_token = str(uuid.uuid4())
                 lease_expires_at = iso_utc(now + EXPORT_LEASE_DURATION)
                 selected_numbers = [item["number"] for item in selected]
-                problem_ids = [item["id"] for item in selected]
                 selection_payload = {
                     "request": request.model_dump(mode="json"),
                     "result": selection_meta,
@@ -430,8 +428,6 @@ class PdfExporter:
                             "subject",
                             "stem_markdown",
                             "choices",
-                            "answer_markdown",
-                            "solution_markdown",
                             "source",
                             "tags",
                             "version",
@@ -545,15 +541,13 @@ class PdfExporter:
             updated = connection.execute(
                 """
                 UPDATE exports SET status = 'ready', questions_path = ?, questions_sha256 = ?,
-                    answers_path = ?, answers_sha256 = ?, completed_at = ?,
+                    completed_at = ?,
                     lease_token = NULL, lease_expires_at = NULL
                 WHERE id = ? AND lease_token = ?
                 """,
                 (
                     result["questions"]["relative_path"],
                     result["questions"]["sha256"],
-                    None,
-                    None,
                     iso_utc(utc_now()),
                     export_id,
                     lease_token,
@@ -561,7 +555,6 @@ class PdfExporter:
             )
             if not updated.rowcount:
                 return self.get_export(export_id)
-            self.service.mark_selected(connection, problem_ids, now)
             connection.execute(
                 """
                 UPDATE idempotency_records SET response_json = ?
@@ -592,6 +585,68 @@ class PdfExporter:
         elif row["status"] == "failed":
             result["error_message"] = row["error_message"]
         return result
+
+    def list_exports(self, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        if not 1 <= limit <= 100:
+            raise ValidationError("limit must be between 1 and 100")
+        if offset < 0:
+            raise ValidationError("offset must be non-negative")
+        rows = self.service.db.fetch_all(
+            """
+            SELECT e.id, e.status, e.questions_path, e.questions_sha256,
+                   e.created_at, e.completed_at, r.title
+            FROM exports e JOIN review_sets r ON r.id = e.review_set_id
+            ORDER BY e.created_at DESC LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        items = []
+        for row in rows:
+            path = None
+            exists = False
+            if row["questions_path"]:
+                path = self._safe_export_path(row["questions_path"], require_exists=False)
+                exists = path.is_file()
+            items.append(
+                {
+                    "export_id": row["id"],
+                    "title": row["title"],
+                    "status": row["status"],
+                    "created_at": row["created_at"],
+                    "completed_at": row["completed_at"],
+                    "questions": {
+                        "relative_path": row["questions_path"],
+                        "sha256": row["questions_sha256"],
+                        "exists": exists,
+                        "size_bytes": path.stat().st_size if exists else 0,
+                    },
+                }
+            )
+        return {"ok": True, "items": items, "limit": limit, "offset": offset}
+
+    def delete_export(self, export_id: str) -> dict[str, Any]:
+        row = self.service.db.fetch_one(
+            "SELECT id, review_set_id, status, questions_path FROM exports WHERE id = ?", (export_id,)
+        )
+        if row is None:
+            raise NotFoundError(f"Export {export_id} was not found")
+        if row["status"] == "generating":
+            raise ValidationError("A generating export cannot be deleted")
+        if row["questions_path"]:
+            path = self._safe_export_path(row["questions_path"], require_exists=False)
+            path.unlink(missing_ok=True)
+        with self.service.db.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                DELETE FROM idempotency_records
+                WHERE scope = 'create_review_sheet'
+                  AND json_extract(response_json, '$.export_id') = ?
+                """,
+                (export_id,),
+            )
+            connection.execute("DELETE FROM exports WHERE id = ?", (export_id,))
+            connection.execute("DELETE FROM review_sets WHERE id = ?", (row["review_set_id"],))
+        return {"ok": True, "export_id": export_id, "status": "deleted"}
 
     def read_export(self, export_id: str, booklet: str) -> bytes:
         if booklet != "questions":
@@ -809,13 +864,13 @@ class PdfExporter:
             "size_bytes": path.stat().st_size,
         }
 
-    def _safe_export_path(self, relative_path: str) -> Path:
+    def _safe_export_path(self, relative_path: str, *, require_exists: bool = True) -> Path:
         path = (self.settings.data_dir / relative_path).resolve()
         exports_root = self.settings.exports_dir.resolve()
         try:
             path.relative_to(exports_root)
         except ValueError as exc:
             raise ExportError("Stored export path is outside the exports directory") from exc
-        if not path.is_file():
+        if require_exists and not path.is_file():
             raise NotFoundError("Export file is missing from storage")
         return path

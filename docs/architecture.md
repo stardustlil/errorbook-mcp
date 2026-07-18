@@ -44,8 +44,8 @@ an expected version. Review updates and idempotency records share one immediate 
 ## Scheduling and queueing
 
 FSRS determines memory state and the next due time. Review-sheet selection is a separate layer that
-combines due urgency, recent error pressure, FSRS difficulty, decaying manual boosts, persistent
-importance, and time since the last successful selection.
+combines due urgency, recent error pressure, FSRS difficulty, decaying manual boosts, and persistent
+importance.
 
 Recent errors have a 42-day half-life and manual boosts a 14-day half-life. Both are saturated before
 scoring so old mistakes cannot dominate forever. Due problems not selected for 28 days enter a
@@ -55,7 +55,8 @@ reason codes for auditability.
 ## Export consistency
 
 Selection first creates a frozen review set. Rendering then acquires a five-minute database lease.
-Only a successful export updates `last_selected_at`; a failed export leaves the questions eligible.
+PDF export is read-only: it does not update FSRS, queue priority, or selection state. Priority changes
+come from explicit review outcomes or user priority adjustments.
 An interrupted process can resume from the same snapshot after the lease expires by reusing the same
 idempotency key.
 

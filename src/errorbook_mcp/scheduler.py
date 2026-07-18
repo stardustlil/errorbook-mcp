@@ -123,7 +123,6 @@ def queue_score(
     lapse_mass_updated_at: datetime,
     manual_boost_mass: float,
     importance: float,
-    last_selected_at: datetime | None,
     retrievability: float | None,
 ) -> QueueScore:
     scheduled_days = max(stability or 1.0, 1.0)
@@ -141,18 +140,12 @@ def queue_score(
     error_pressure = 1.0 - math.exp(-max(error_mass, 0.0))
     boost_pressure = math.copysign(1.0 - math.exp(-abs(manual_boost_mass)), manual_boost_mass)
     normalized_difficulty = min(max(((difficulty or 5.0) - 1.0) / 9.0, 0.0), 1.0)
-    if last_selected_at is None:
-        age = 1.0
-    else:
-        age = min(max(((now - last_selected_at).total_seconds() / 86_400 - 7) / 49, 0), 1)
-
     components = {
         "urgency": 42.0 * urgency,
         "recent_error": 22.0 * error_pressure,
         "difficulty": 12.0 * normalized_difficulty,
         "manual_boost": 10.0 * boost_pressure,
         "importance": 8.0 * importance,
-        "not_recently_selected": 6.0 * age,
     }
     reasons: list[str] = []
     overdue_days = max((now - due_at).days, 0)
@@ -170,9 +163,6 @@ def queue_score(
         reasons.append("manual_boost")
     if difficulty and difficulty >= 7:
         reasons.append("high_difficulty")
-    if last_selected_at is None:
-        reasons.append("never_selected")
-
     return QueueScore(
         total=round(sum(components.values()), 4),
         components={name: round(value, 4) for name, value in components.items()},
