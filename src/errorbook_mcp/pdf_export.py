@@ -84,6 +84,27 @@ MAX_FORMULAS_PER_FIELD = 200
 EXPORT_LEASE_DURATION = timedelta(minutes=5)
 
 
+def _normalize_math_delimiters(text: str) -> str:
+    """Normalize TeX delimiters commonly emitted by OCR into dollar math."""
+    text = re.sub(r"\\\[(.*?)\\\]", lambda match: f"$$\n{match.group(1)}\n$$", text, flags=re.DOTALL)
+    return re.sub(r"\\\((.*?)\\\)", lambda match: f"${match.group(1)}$", text, flags=re.DOTALL)
+
+
+def _validate_formula_markup(text: str, *, context: str) -> None:
+    """Reject common TeX that was left in prose instead of marked as math."""
+    prose = re.sub(r"\$\$.*?\$\$|\$[^$\n]+\$", "", text, flags=re.DOTALL)
+    if re.search(r"\\(?:frac|dfrac|tfrac|sqrt|sum|prod|int|iint|oint|lim|cdot|times|leq?|geq?|neq|pm|mid|begin|end)\b", prose):
+        raise ExportError(
+            f"LaTeX command must be enclosed in math delimiters in {context}",
+            details={"context": context},
+        )
+    if re.search(r"(?<![\w$])[A-Za-z](?:[A-Za-z0-9]*)\s*[\^_]\s*\{?[-+A-Za-z0-9]", prose):
+        raise ExportError(
+            f"Superscripts and subscripts must be enclosed in math delimiters in {context}",
+            details={"context": context},
+        )
+
+
 CSS = """
 @page {
   size: A4;
@@ -165,9 +186,6 @@ pre { white-space: pre-wrap; padding: 2.5mm; border: 0.2mm solid #ddd; }
 .math.inline { white-space: nowrap; }
 .math.block { overflow: hidden; margin: 3mm 0; text-align: center; }
 math[display="block"] { margin: 0 auto; max-width: 100%; }
-.answer-section { break-before: page; }
-.answer-item { margin: 0 0 8mm; }
-.answer-label { font-weight: 700; margin: 2mm 0 1mm; }
 .empty { color: #777; font-style: italic; }
 """
 
@@ -190,6 +208,8 @@ class SafeMarkdownRenderer:
             return ""
         self.context = context
         self.formula_count = 0
+        text = _normalize_math_delimiters(text)
+        _validate_formula_markup(text, context=context)
         markdown = MarkdownIt(
             "commonmark",
             {"html": False, "linkify": False, "typographer": False},
@@ -474,7 +494,6 @@ class PdfExporter:
                 export_id=export_id,
                 title=request.title,
                 snapshots=snapshots,
-                include_answer_booklet=request.include_answer_booklet,
                 generated_at=now,
             )
         except Exception as exc:
@@ -533,8 +552,8 @@ class PdfExporter:
                 (
                     result["questions"]["relative_path"],
                     result["questions"]["sha256"],
-                    result.get("answers", {}).get("relative_path"),
-                    result.get("answers", {}).get("sha256"),
+                    None,
+                    None,
                     iso_utc(utc_now()),
                     export_id,
                     lease_token,
@@ -570,21 +589,15 @@ class PdfExporter:
             result["questions"] = self._file_descriptor(
                 export_id, "questions", row["questions_path"], row["questions_sha256"]
             )
-            if row["answers_path"]:
-                result["answers"] = self._file_descriptor(
-                    export_id, "answers", row["answers_path"], row["answers_sha256"]
-                )
         elif row["status"] == "failed":
             result["error_message"] = row["error_message"]
         return result
 
     def read_export(self, export_id: str, booklet: str) -> bytes:
-        if booklet not in {"questions", "answers"}:
-            raise ValidationError("booklet must be questions or answers")
-        column = "questions_path" if booklet == "questions" else "answers_path"
-        sha_column = "questions_sha256" if booklet == "questions" else "answers_sha256"
+        if booklet != "questions":
+            raise ValidationError("Only the questions booklet is available")
         row = self.service.db.fetch_one(
-            f"SELECT status, {column} AS path, {sha_column} AS sha256 FROM exports WHERE id = ?",
+            "SELECT status, questions_path AS path, questions_sha256 AS sha256 FROM exports WHERE id = ?",
             (export_id,),
         )
         if row is None:
@@ -605,7 +618,6 @@ class PdfExporter:
         export_id: str,
         title: str,
         snapshots: list[dict[str, Any]],
-        include_answer_booklet: bool,
         generated_at: datetime,
     ) -> dict[str, Any]:
         published_paths: list[Path] = []
@@ -617,7 +629,6 @@ class PdfExporter:
                 title=title,
                 snapshots=snapshots,
                 generated_at=generated_at,
-                answer_booklet=False,
             )
             self._html_to_pdf(questions_html, questions_path, f"{export_id}-questions")
             published_paths.append(questions_path)
@@ -626,21 +637,6 @@ class PdfExporter:
                     export_id, "questions", questions_relative, _sha256(questions_path)
                 )
             }
-            if include_answer_booklet:
-                answers_name = f"{export_id}-answers.pdf"
-                answers_relative = f"exports/{answers_name}"
-                answers_path = self.settings.data_dir / answers_relative
-                answers_html = self._build_html(
-                    title=f"{title} - 答案册",
-                    snapshots=snapshots,
-                    generated_at=generated_at,
-                    answer_booklet=True,
-                )
-                self._html_to_pdf(answers_html, answers_path, f"{export_id}-answers")
-                published_paths.append(answers_path)
-                result["answers"] = self._file_descriptor(
-                    export_id, "answers", answers_relative, _sha256(answers_path)
-                )
             return result
         except BaseException:
             for published in published_paths:
@@ -653,7 +649,6 @@ class PdfExporter:
         title: str,
         snapshots: list[dict[str, Any]],
         generated_at: datetime,
-        answer_booklet: bool,
     ) -> str:
         local_time = generated_at.astimezone(self.settings.timezone)
         markdown = SafeMarkdownRenderer()
@@ -670,10 +665,9 @@ class PdfExporter:
             f"<span>生成时间 {local_time:%Y-%m-%d %H:%M}</span>",
             "</div>",
         ]
-        if not answer_booklet:
-            parts.append(
-                "<div class='identity'>姓名：____________　日期：____________　得分：____________</div>"
-            )
+        parts.append(
+            "<div class='identity'>姓名：____________　日期：____________　得分：____________</div>"
+        )
         for snapshot in snapshots:
             number = snapshot["number"]
             context_prefix = f"{number}"
@@ -687,60 +681,34 @@ class PdfExporter:
                     "</div>",
                 ]
             )
-            if answer_booklet:
-                parts.append("<div class='answer-item'>")
-                parts.append("<div class='answer-label'>答案</div>")
-                if snapshot["answer_markdown"]:
-                    parts.append(
-                        "<div class='markdown'>"
-                        + markdown.render(
-                            snapshot["answer_markdown"], context=f"{context_prefix} answer"
-                        )
-                        + "</div>"
+            parts.append(
+                "<div class='markdown'>"
+                + markdown.render(snapshot["stem_markdown"], context=f"{context_prefix} stem")
+                + "</div>"
+            )
+            if snapshot["choices"]:
+                parts.append("<div class='choices'>")
+                for choice in snapshot["choices"]:
+                    parts.extend(
+                        [
+                            "<div class='choice'>",
+                            f"<div class='choice-label'>{html.escape(choice['label'])}.</div>",
+                            "<div class='markdown'>"
+                            + markdown.render(
+                                choice["content_markdown"],
+                                context=f"{context_prefix} choice {choice['label']}",
+                            )
+                            + "</div>",
+                            "</div>",
+                        ]
                     )
-                else:
-                    parts.append("<div class='empty'>未录入答案</div>")
-                parts.append("<div class='answer-label'>解析</div>")
-                if snapshot["solution_markdown"]:
-                    parts.append(
-                        "<div class='markdown'>"
-                        + markdown.render(
-                            snapshot["solution_markdown"], context=f"{context_prefix} solution"
-                        )
-                        + "</div>"
-                    )
-                else:
-                    parts.append("<div class='empty'>未录入解析</div>")
                 parts.append("</div>")
-            else:
-                parts.append(
-                    "<div class='markdown'>"
-                    + markdown.render(snapshot["stem_markdown"], context=f"{context_prefix} stem")
-                    + "</div>"
-                )
-                if snapshot["choices"]:
-                    parts.append("<div class='choices'>")
-                    for choice in snapshot["choices"]:
-                        parts.extend(
-                            [
-                                "<div class='choice'>",
-                                f"<div class='choice-label'>{html.escape(choice['label'])}.</div>",
-                                "<div class='markdown'>"
-                                + markdown.render(
-                                    choice["content_markdown"],
-                                    context=f"{context_prefix} choice {choice['label']}",
-                                )
-                                + "</div>",
-                                "</div>",
-                            ]
-                        )
-                    parts.append("</div>")
-                area_class = (
-                    "work-area compact"
-                    if snapshot["kind"] in {"single_choice", "multiple_choice"}
-                    else "work-area"
-                )
-                parts.append(f"<div class='{area_class}'></div>")
+            area_class = (
+                "work-area compact"
+                if snapshot["kind"] in {"single_choice", "multiple_choice"}
+                else "work-area"
+            )
+            parts.append(f"<div class='{area_class}'></div>")
             parts.append("</article>")
         parts.append("</body></html>")
         return "".join(parts)

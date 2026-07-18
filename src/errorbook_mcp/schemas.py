@@ -108,7 +108,6 @@ class ReviewSheetRequest(StrictModel):
     tags: list[str] = Field(default_factory=list, max_length=30)
     horizon_days: int = Field(default=7, ge=0, le=90)
     max_questions: int = Field(default=30, ge=1, le=200)
-    include_answer_booklet: bool = False
 
     @model_validator(mode="after")
     def validate_mode(self) -> ReviewSheetRequest:
@@ -118,6 +117,9 @@ class ReviewSheetRequest(StrictModel):
 
 
 def _validate_math_delimiters(text: str) -> None:
+    # Accept the TeX delimiters commonly produced by OCR and PDF copy/paste.
+    text = re.sub(r"\\\[(.*?)\\\]", lambda match: f"$$\n{match.group(1)}\n$$", text, flags=re.DOTALL)
+    text = re.sub(r"\\\((.*?)\\\)", lambda match: f"${match.group(1)}$", text, flags=re.DOTALL)
     visible_lines: list[str] = []
     fence_character: str | None = None
     fence_length = 0

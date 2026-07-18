@@ -29,10 +29,10 @@ Errorbook MCP 是一个可直接接入支持 Model Context Protocol (MCP) 的 ag
 | Tool | `record_review` | 追加真实作答结果并更新 FSRS |
 | Tool | `adjust_priority` | 记录用户明确提出的临时优先级调整 |
 | Tool | `set_problem_status` | 在 active、mastered、archived 之间切换，不硬删除历史 |
-| Tool | `create_review_sheet` | 冻结题目快照并生成 A4 问题卷和可选答案册 |
+| Tool | `create_review_sheet` | 冻结题目快照并生成仅含题目的 A4 错题复习卷 |
 | Tool | `get_export_status` | 查询导出状态、路径、资源 URI、大小和 SHA-256 |
 | Tool | `get_library_stats` | 查看题库、到期积压和学科分布 |
-| Resource | `errorbook://exports/{export_id}/{booklet}` | 读取 questions 或 answers PDF 二进制内容 |
+| Resource | `errorbook://exports/{export_id}/questions` | 读取 questions PDF 二进制内容 |
 
 所有有副作用的操作都接收 `idempotency_key`。建议 agent 使用“用户会话/动作类型/随机 UUID”组成的 8-128 字符键，并在网络重试时保持不变。
 
@@ -137,7 +137,7 @@ uv run python -m errorbook_mcp
 
 - 做错后调用 `record_review(outcome="incorrect")`；这既保留历史，也会通过 FSRS 自动提前下次复习。
 - 用户明确说“提高 EB-2026-000123 的优先级”时调用 `adjust_priority`。不要用优先级工具伪造一次作答。
-- 每周调用 `create_review_sheet`，默认选择已经到期和未来七天内到期的题目，并生成问题卷；可以选择额外生成答案册。
+- 每周调用 `create_review_sheet`，默认选择已经到期和未来七天内到期的题目，并生成仅含题目的错题复习卷。
 - 工具返回本地绝对路径、SHA-256 和 `errorbook://exports/...` MCP resource URI。
 
 PDF 将原始 Markdown 转为静态 MathML，再由本机 Edge/Chrome/Chromium 打印，不执行 JavaScript 或 TeX 程序。原始 HTML、外部图片、链接和危险 LaTeX 命令会被拒绝。资源读取时会重新核对 SHA-256；文件被替换或损坏时不会静默返回。

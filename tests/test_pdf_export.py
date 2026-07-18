@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pypdf import PdfReader
 
-from errorbook_mcp.errors import ExportError
+from errorbook_mcp.errors import ExportError, ValidationError
 from errorbook_mcp.pdf_export import PdfExporter, SafeMarkdownRenderer
 from errorbook_mcp.scheduler import iso_utc, utc_now
 from errorbook_mcp.schemas import ProblemPatch, ReviewSheetRequest
@@ -26,6 +26,13 @@ def test_mathml_renderer_supports_common_math_and_escapes_html() -> None:
     assert "<math" in output
     assert "<script>" not in output
     assert "&lt;script&gt;" in output
+
+
+def test_mathml_renderer_supports_tex_delimiters() -> None:
+    renderer = SafeMarkdownRenderer()
+    output = renderer.render(r"\[I=\iint_D e^{\max{x^2,y^2}}\,dx\,dy\]", context="test stem")
+    assert output.count("<math") == 1
+    assert r"\iint" not in output
 
 
 @pytest.mark.parametrize(
@@ -63,22 +70,22 @@ def test_pdf_export_end_to_end_and_snapshot(service: ErrorbookService) -> None:
         title="每周错题复习卷",
         mode="numbers",
         numbers=numbers,
-        include_answer_booklet=True,
     )
     result = exporter.create_review_sheet(request, idempotency_key="pdf-export-0001")
     assert result["status"] == "ready", result
     assert result["selected_numbers"] == numbers
-    for booklet in ("questions", "answers"):
-        descriptor = result[booklet]
-        path = Path(descriptor["local_path"])
-        assert path.is_file()
-        assert path.read_bytes().startswith(b"%PDF")
-        reader = PdfReader(path)
-        assert len(reader.pages) >= 1
-        text = "".join(page.extract_text() or "" for page in reader.pages)
-        for number in numbers:
-            assert number in text
-        assert exporter.read_export(result["export_id"], booklet).startswith(b"%PDF")
+    descriptor = result["questions"]
+    path = Path(descriptor["local_path"])
+    assert path.is_file()
+    assert path.read_bytes().startswith(b"%PDF")
+    reader = PdfReader(path)
+    assert len(reader.pages) >= 1
+    text = "".join(page.extract_text() or "" for page in reader.pages)
+    for number in numbers:
+        assert number in text
+    assert exporter.read_export(result["export_id"], "questions").startswith(b"%PDF")
+    with pytest.raises(ValidationError):
+        exporter.read_export(result["export_id"], "answers")
 
     replay = exporter.create_review_sheet(request, idempotency_key="pdf-export-0001")
     assert replay["export_id"] == result["export_id"]
@@ -192,44 +199,8 @@ def test_pdf_renderer_has_no_cross_request_formula_counter(service: ErrorbookSer
                 }
             ],
             generated_at=utc_now(),
-            answer_booklet=False,
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         outputs = list(executor.map(render, ["EB-2026-000001", "EB-2026-000002"]))
     assert all(output.count("<math") == 150 for output in outputs)
-
-
-def test_answer_failure_removes_published_question_file(
-    service: ErrorbookService, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    exporter = PdfExporter(service)
-
-    def fail_on_answers(document: str, target: Path, job_name: str) -> None:
-        del document
-        if job_name.endswith("answers"):
-            raise ExportError("answer rendering failed")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"%PDF-1.7\n" + b"x" * 2_000)
-
-    monkeypatch.setattr(exporter, "_html_to_pdf", fail_on_answers)
-    with pytest.raises(ExportError, match="answer rendering failed"):
-        exporter._render_export(
-            export_id="cleanup-test",
-            title="清理测试",
-            snapshots=[
-                {
-                    "position": 1,
-                    "number": "EB-2026-000001",
-                    "kind": "solution",
-                    "subject": "数学",
-                    "stem_markdown": "$x=1$",
-                    "choices": [],
-                    "answer_markdown": "$1$",
-                    "solution_markdown": None,
-                }
-            ],
-            include_answer_booklet=True,
-            generated_at=utc_now(),
-        )
-    assert list(service.settings.exports_dir.glob("cleanup-test-*.pdf")) == []
