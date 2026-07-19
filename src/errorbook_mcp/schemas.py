@@ -14,6 +14,19 @@ from pydantic import (
 )
 
 NonEmpty = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+ProblemNumberText = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)
+]
+SubjectFilterText = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)
+]
+TagFilterText = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)
+]
+MAX_REVIEW_RESPONSE_LENGTH = 100_000
+MAX_REVIEW_NOTES_LENGTH = 20_000
+ReviewResponseMarkdown = Annotated[str, StringConstraints(max_length=MAX_REVIEW_RESPONSE_LENGTH)]
+ReviewNotes = Annotated[str, StringConstraints(max_length=MAX_REVIEW_NOTES_LENGTH)]
 ProblemKind = Literal["single_choice", "multiple_choice", "short_answer", "solution"]
 ProblemStatus = Literal["active", "mastered", "archived"]
 ReviewOutcome = Literal["incorrect", "partial", "correct", "easy", "skipped"]
@@ -74,9 +87,9 @@ class ProblemPatch(StrictModel):
 
 class SearchFilters(StrictModel):
     text: Annotated[str, StringConstraints(max_length=500)] | None = None
-    numbers: list[str] = Field(default_factory=list, max_length=100)
-    subjects: list[str] = Field(default_factory=list, max_length=30)
-    tags: list[str] = Field(default_factory=list, max_length=30)
+    numbers: list[ProblemNumberText] = Field(default_factory=list, max_length=100)
+    subjects: list[SubjectFilterText] = Field(default_factory=list, max_length=30)
+    tags: list[TagFilterText] = Field(default_factory=list, max_length=30)
     kinds: list[ProblemKind] = Field(default_factory=list, max_length=4)
     statuses: list[ProblemStatus] = Field(default_factory=lambda: ["active"])
     due_before: datetime | None = None
@@ -95,9 +108,9 @@ class SearchFilters(StrictModel):
 class ReviewSheetRequest(StrictModel):
     title: Annotated[str, StringConstraints(min_length=1, max_length=120)] = "错题复习卷"
     mode: Literal["scheduled", "all_active", "numbers"] = "scheduled"
-    numbers: list[str] = Field(default_factory=list, max_length=200)
-    subjects: list[str] = Field(default_factory=list, max_length=30)
-    tags: list[str] = Field(default_factory=list, max_length=30)
+    numbers: list[ProblemNumberText] = Field(default_factory=list, max_length=200)
+    subjects: list[SubjectFilterText] = Field(default_factory=list, max_length=30)
+    tags: list[TagFilterText] = Field(default_factory=list, max_length=30)
     horizon_days: int = Field(default=7, ge=0, le=90)
     max_questions: int = Field(default=30, ge=1, le=200)
 

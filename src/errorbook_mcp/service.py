@@ -23,6 +23,7 @@ from .scheduler import (
     ALGORITHM_VERSION,
     MANUAL_BOOST_HALF_LIFE_DAYS,
     MemoryScheduler,
+    QueueScore,
     decay,
     iso_utc,
     parse_datetime,
@@ -30,7 +31,14 @@ from .scheduler import (
     update_lapse_mass,
     utc_now,
 )
-from .schemas import ProblemDraft, ProblemPatch, ReviewOutcome, SearchFilters
+from .schemas import (
+    MAX_REVIEW_NOTES_LENGTH,
+    MAX_REVIEW_RESPONSE_LENGTH,
+    ProblemDraft,
+    ProblemPatch,
+    ReviewOutcome,
+    SearchFilters,
+)
 
 MAX_FUTURE_REVIEW_SKEW = timedelta(minutes=5)
 IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
@@ -266,30 +274,42 @@ class ErrorbookService:
 
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.db.transaction() as connection:
-            rows = connection.execute(
-                "SELECT p.* FROM problems p" + where,
-                tuple(parameters),
-            ).fetchall()
             now = utc_now()
-            serialized = [self._serialize_problem(connection, row, now=now) for row in rows]
-
-        if filters.sort == "priority":
-            serialized.sort(
-                key=lambda item: (
-                    -item["priority"]["score"],
-                    item["memory"]["due_at"],
-                    item["number"],
+            if filters.sort == "priority":
+                ranked, manual_masses = self._rank_problem_rows(
+                    connection, where=where, parameters=tuple(parameters), now=now
                 )
-            )
-        elif filters.sort == "due":
-            serialized.sort(key=lambda item: (item["memory"]["due_at"], item["number"]))
-        elif filters.sort == "created":
-            serialized.sort(key=lambda item: (item["created_at"], item["number"]), reverse=True)
-        else:
-            serialized.sort(key=lambda item: item["number"])
+                ranked.sort(key=lambda item: (-item["score"].total, item["due_at"], item["number"]))
+                total = len(ranked)
+                page_ranked = ranked[filters.offset : filters.offset + filters.limit]
+                rows_by_id = self._problem_rows_by_id(
+                    connection, [item["id"] for item in page_ranked]
+                )
+                page = [
+                    self._serialize_problem(
+                        connection,
+                        rows_by_id[item["id"]],
+                        now=now,
+                        manual_mass=manual_masses[item["id"]],
+                    )
+                    for item in page_ranked
+                ]
+            else:
+                total = connection.execute(
+                    "SELECT COUNT(*) AS count FROM problems p" + where,
+                    tuple(parameters),
+                ).fetchone()["count"]
+                order_by = {
+                    "due": "p.due_at, p.number",
+                    "created": "p.created_at DESC, p.number DESC",
+                    "number": "p.number",
+                }[filters.sort]
+                rows = connection.execute(
+                    "SELECT p.* FROM problems p" + where + f" ORDER BY {order_by} LIMIT ? OFFSET ?",
+                    (*parameters, filters.limit, filters.offset),
+                ).fetchall()
+                page = [self._serialize_problem(connection, row, now=now) for row in rows]
 
-        total = len(serialized)
-        page = serialized[filters.offset : filters.offset + filters.limit]
         return {
             "ok": True,
             "items": page,
@@ -408,6 +428,16 @@ class ErrorbookService:
         self._validate_idempotency_key(idempotency_key)
         if duration_seconds is not None and not 0 <= duration_seconds <= 86_400:
             raise ValidationError("duration_seconds must be between 0 and 86400")
+        if response_markdown is not None and len(response_markdown) > MAX_REVIEW_RESPONSE_LENGTH:
+            raise ValidationError(
+                f"response_markdown must contain at most {MAX_REVIEW_RESPONSE_LENGTH} characters"
+            )
+        if notes is not None and len(notes) > MAX_REVIEW_NOTES_LENGTH:
+            raise ValidationError(
+                f"notes must contain at most {MAX_REVIEW_NOTES_LENGTH} characters"
+            )
+        response_markdown = _normalized_markdown(response_markdown)
+        notes = _normalized_markdown(notes)
         provided_reviewed_at = reviewed_at
         if reviewed_at is not None:
             reviewed_at = parse_datetime(reviewed_at)
@@ -437,6 +467,8 @@ class ErrorbookService:
                 raise ConflictError(f"Problem {row['number']} is archived")
 
             card = self.memory.load_card(json.loads(row["fsrs_card_json"]))
+            if card.last_review is None and reviewed_at < parse_datetime(row["created_at"]):
+                raise ValidationError("reviewed_at cannot predate problem creation")
             before = card.to_dict()
             reviewed_card = self.memory.review(
                 card, outcome, reviewed_at, duration_seconds=duration_seconds
@@ -471,8 +503,8 @@ class ErrorbookService:
                     str(uuid.uuid4()),
                     row["id"],
                     outcome,
-                    _normalized_markdown(response_markdown),
-                    _normalized_markdown(notes),
+                    response_markdown,
+                    notes,
                     duration_seconds,
                     iso_utc(reviewed_at),
                     self.algorithm_version,
@@ -682,54 +714,58 @@ class ErrorbookService:
             parameters.append(tag)
 
         with self.db.transaction() as connection:
-            rows = connection.execute(
-                "SELECT p.* FROM problems p WHERE " + " AND ".join(clauses),
-                tuple(parameters),
-            ).fetchall()
+            where = " WHERE " + " AND ".join(clauses)
+            ranked, manual_masses = self._rank_problem_rows(
+                connection, where=where, parameters=tuple(parameters), now=now
+            )
             candidates: list[dict[str, Any]] = []
             horizon = now + timedelta(days=horizon_days)
-            for row in rows:
-                problem = self._serialize_problem(connection, row, now=now)
+            for candidate in ranked:
                 if mode == "scheduled":
-                    due = parse_datetime(row["due_at"])
-                    manual = problem["priority"]["manual_boost_mass"]
+                    due = parse_datetime(candidate["due_at"])
+                    manual = manual_masses[candidate["id"]]
                     if due > horizon and manual < 0.25:
                         continue
-                candidates.append(problem)
+                candidates.append(candidate)
 
-        candidates.sort(
-            key=lambda item: (-item["priority"]["score"], item["memory"]["due_at"], item["number"])
-        )
-        fairness_cutoff = now - timedelta(days=28)
-        must_include = [
-            item
-            for item in candidates
-            if parse_datetime(item["memory"]["due_at"]) <= now
-            and parse_datetime(item["created_at"]) <= fairness_cutoff
-        ]
-        must_include.sort(
-            key=lambda item: (
-                item["created_at"],
-                item["memory"]["due_at"],
-                item["number"],
+            candidates.sort(key=lambda item: (-item["score"].total, item["due_at"], item["number"]))
+            fairness_cutoff = now - timedelta(days=28)
+            must_include = [
+                item
+                for item in candidates
+                if parse_datetime(item["due_at"]) <= now
+                and parse_datetime(item["created_at"]) <= fairness_cutoff
+            ]
+            must_include.sort(key=lambda item: (item["created_at"], item["due_at"], item["number"]))
+            must_ids = {item["id"] for item in must_include}
+            ranked_remainder = [item for item in candidates if item["id"] not in must_ids]
+            selected_ranked = (must_include + ranked_remainder)[:max_questions]
+            rows_by_id = self._problem_rows_by_id(
+                connection, [item["id"] for item in selected_ranked]
             )
-        )
-        must_numbers = {item["number"] for item in must_include}
-        for item in must_include:
-            item["priority"]["reasons"].append("fairness_must_include")
-        ranked_remainder = [item for item in candidates if item["number"] not in must_numbers]
-        selected = (must_include + ranked_remainder)[:max_questions]
-        backlog_count = max(len(candidates) - len(selected), 0)
-        metadata = {
-            "candidate_count": len(candidates),
-            "selected_count": len(selected),
-            "backlog_count": backlog_count,
-            "estimated_weeks_to_clear_backlog": math.ceil(backlog_count / max_questions),
-            "must_include_count": len(must_include),
-            "must_include_overflow": max(len(must_include) - max_questions, 0),
-            "horizon_end": iso_utc(now + timedelta(days=horizon_days)),
-        }
-        return selected, metadata
+            selected = []
+            for item in selected_ranked:
+                problem = self._serialize_problem(
+                    connection,
+                    rows_by_id[item["id"]],
+                    now=now,
+                    manual_mass=manual_masses[item["id"]],
+                )
+                if item["id"] in must_ids:
+                    problem["priority"]["reasons"].append("fairness_must_include")
+                selected.append(problem)
+
+            backlog_count = max(len(candidates) - len(selected), 0)
+            metadata = {
+                "candidate_count": len(candidates),
+                "selected_count": len(selected),
+                "backlog_count": backlog_count,
+                "estimated_weeks_to_clear_backlog": math.ceil(backlog_count / max_questions),
+                "must_include_count": len(must_include),
+                "must_include_overflow": max(len(must_include) - max_questions, 0),
+                "horizon_end": iso_utc(now + timedelta(days=horizon_days)),
+            }
+            return selected, metadata
 
     def _serialize_problem(
         self,
@@ -738,23 +774,12 @@ class ErrorbookService:
         *,
         now: datetime,
         include_history: bool = False,
+        manual_mass: float | None = None,
     ) -> dict[str, Any]:
         card = self.memory.load_card(json.loads(row["fsrs_card_json"]))
-        retrievability = self.memory.retrievability(card, now)
-        manual_mass = self._manual_boost_mass(connection, row["id"], now)
-        last_reviewed = parse_datetime(row["last_reviewed_at"]) if row["last_reviewed_at"] else None
-        score = queue_score(
-            now=now,
-            due_at=parse_datetime(row["due_at"]),
-            last_reviewed_at=last_reviewed,
-            stability=row["stability"],
-            difficulty=row["difficulty"],
-            lapse_mass=row["lapse_mass"],
-            lapse_mass_updated_at=parse_datetime(row["lapse_mass_updated_at"]),
-            manual_boost_mass=manual_mass,
-            importance=row["importance"],
-            retrievability=retrievability,
-        )
+        if manual_mass is None:
+            manual_mass = self._manual_boost_mass(connection, row["id"], now)
+        score = self._queue_score_for_row(row, now=now, manual_mass=manual_mass, card=card)
         result: dict[str, Any] = {
             "id": row["id"],
             "number": row["number"],
@@ -819,6 +844,92 @@ class ErrorbookService:
                 ).fetchall()
             ]
         return result
+
+    def _rank_problem_rows(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        where: str,
+        parameters: tuple[Any, ...],
+        now: datetime,
+    ) -> tuple[list[dict[str, Any]], dict[int, float]]:
+        rows = connection.execute(
+            """
+            SELECT p.id, p.number, p.fsrs_card_json, p.due_at, p.last_reviewed_at,
+                   p.stability, p.difficulty, p.lapse_mass, p.lapse_mass_updated_at,
+                   p.importance, p.created_at
+            FROM problems p
+            """
+            + where,
+            parameters,
+        ).fetchall()
+        manual_masses = {int(row["id"]): 0.0 for row in rows}
+        for event in connection.execute(
+            """
+            SELECT pe.problem_id, pe.points, pe.half_life_days, pe.created_at
+            FROM priority_events pe JOIN problems p ON p.id = pe.problem_id
+            """
+            + where,
+            parameters,
+        ):
+            elapsed = (now - parse_datetime(event["created_at"])).total_seconds() / 86_400
+            manual_masses[int(event["problem_id"])] += decay(
+                event["points"], elapsed, event["half_life_days"]
+            )
+        manual_masses = {
+            problem_id: min(max(mass, -5.0), 5.0) for problem_id, mass in manual_masses.items()
+        }
+        ranked = [
+            {
+                "id": int(row["id"]),
+                "number": row["number"],
+                "due_at": row["due_at"],
+                "created_at": row["created_at"],
+                "score": self._queue_score_for_row(
+                    row, now=now, manual_mass=manual_masses[int(row["id"])]
+                ),
+            }
+            for row in rows
+        ]
+        return ranked, manual_masses
+
+    def _queue_score_for_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        now: datetime,
+        manual_mass: float,
+        card: Any | None = None,
+    ) -> QueueScore:
+        if card is None:
+            card = self.memory.load_card(json.loads(row["fsrs_card_json"]))
+        retrievability = self.memory.retrievability(card, now)
+        last_reviewed = parse_datetime(row["last_reviewed_at"]) if row["last_reviewed_at"] else None
+        return queue_score(
+            now=now,
+            due_at=parse_datetime(row["due_at"]),
+            last_reviewed_at=last_reviewed,
+            stability=row["stability"],
+            difficulty=row["difficulty"],
+            lapse_mass=row["lapse_mass"],
+            lapse_mass_updated_at=parse_datetime(row["lapse_mass_updated_at"]),
+            manual_boost_mass=manual_mass,
+            importance=row["importance"],
+            retrievability=retrievability,
+        )
+
+    def _problem_rows_by_id(
+        self, connection: sqlite3.Connection, problem_ids: list[int]
+    ) -> dict[int, sqlite3.Row]:
+        if not problem_ids:
+            return {}
+        placeholders = ",".join("?" for _ in problem_ids)
+        return {
+            int(row["id"]): row
+            for row in connection.execute(
+                f"SELECT * FROM problems WHERE id IN ({placeholders})", tuple(problem_ids)
+            ).fetchall()
+        }
 
     def _content_snapshot(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         return {

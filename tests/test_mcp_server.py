@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import sqlite3
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
 
 from errorbook_mcp.config import Settings
-from errorbook_mcp.server import _invoke, create_server
+from errorbook_mcp.schemas import MAX_REVIEW_NOTES_LENGTH, MAX_REVIEW_RESPONSE_LENGTH, ProblemDraft
+from errorbook_mcp.server import _invoke, _parse_args, create_server
 
 
 def test_mcp_surface_is_registered(settings: Settings) -> None:
@@ -44,6 +48,15 @@ def test_mcp_surface_is_registered(settings: Settings) -> None:
         "mastered",
         "archived",
     ]
+    review_tool = next(tool for tool in tools if tool.name == "record_review")
+    response_schema = review_tool.inputSchema["properties"]["response_markdown"]
+    notes_schema = review_tool.inputSchema["properties"]["notes"]
+    assert any(
+        option.get("maxLength") == MAX_REVIEW_RESPONSE_LENGTH for option in response_schema["anyOf"]
+    )
+    assert any(
+        option.get("maxLength") == MAX_REVIEW_NOTES_LENGTH for option in notes_schema["anyOf"]
+    )
 
     prompts = asyncio.run(server.list_prompts())
     assert {prompt.name for prompt in prompts} == {"record_from_image"}
@@ -58,6 +71,50 @@ def test_database_lock_is_reported_as_retryable() -> None:
     result = _invoke(locked)
     assert result["error"]["code"] == "DATABASE_BUSY"
     assert result["error"]["retryable"] is True
+
+
+def test_invoke_normalizes_validation_storage_and_internal_errors() -> None:
+    def invalid_problem() -> dict[str, object]:
+        ProblemDraft.model_validate({"kind": "solution", "subject": "", "stem_markdown": "x"})
+        raise AssertionError("validation should fail")
+
+    def storage_failure() -> dict[str, object]:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def unexpected_failure() -> dict[str, object]:
+        raise RuntimeError("secret internal detail")
+
+    validation = _invoke(invalid_problem)
+    storage = _invoke(storage_failure)
+    internal = _invoke(unexpected_failure)
+
+    assert validation["error"]["code"] == "VALIDATION_ERROR"
+    assert validation["error"]["details"]["issues"]
+    assert storage["error"]["code"] == "STORAGE_ERROR"
+    assert internal["error"]["code"] == "INTERNAL_ERROR"
+    assert "secret internal detail" not in internal["error"]["message"]
+
+
+def test_cli_arguments_are_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "errorbook-mcp",
+            "--transport",
+            "streamable-http",
+            "--host",
+            "127.0.0.2",
+            "--port",
+            "8123",
+        ],
+    )
+    arguments = _parse_args()
+    assert (arguments.transport, arguments.host, arguments.port) == (
+        "streamable-http",
+        "127.0.0.2",
+        8123,
+    )
 
 
 @pytest.mark.asyncio
@@ -103,3 +160,70 @@ async def test_stdio_mcp_round_trip(tmp_path: Path) -> None:
         assert result.structuredContent is not None
         assert result.structuredContent["ok"] is True
         assert result.structuredContent["problem"]["number"].startswith("EB-")
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_mcp_round_trip(tmp_path: Path) -> None:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    data_dir = tmp_path / "http-data"
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "ERRORBOOK_DATA_DIR": str(data_dir),
+            "ERRORBOOK_TIMEZONE": "Asia/Tokyo",
+            "ERRORBOOK_LOG_LEVEL": "ERROR",
+        }
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "errorbook_mcp",
+        "--transport",
+        "streamable-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        cwd=str(Path.cwd()),
+        env=environment,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(100):
+            if process.returncode is not None:
+                raise AssertionError(f"HTTP MCP server exited with {process.returncode}")
+            try:
+                _, writer = await asyncio.open_connection("127.0.0.1", port)
+            except OSError:
+                await asyncio.sleep(0.05)
+                continue
+            writer.close()
+            await writer.wait_closed()
+            break
+        else:
+            raise AssertionError("HTTP MCP server did not start")
+
+        async with (
+            httpx.AsyncClient(follow_redirects=True, trust_env=False) as http_client,
+            streamable_http_client(
+                f"http://127.0.0.1:{port}/mcp",
+                http_client=http_client,
+            ) as streams,
+            ClientSession(streams[0], streams[1]) as session,
+        ):
+            await session.initialize()
+            result = await session.call_tool("get_library_stats", {})
+            assert result.isError is False
+            assert result.structuredContent is not None
+            assert result.structuredContent["ok"] is True
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except TimeoutError:
+                process.kill()
+                await process.wait()

@@ -40,6 +40,12 @@ def test_error_mass_saturates_and_success_reduces_it() -> None:
     assert reduced == pytest.approx(mass * 0.5)
 
 
+def test_error_mass_handles_partial_easy_and_skipped_reviews() -> None:
+    assert update_lapse_mass(2.0, NOW, "partial", NOW) == pytest.approx(2.5)
+    assert update_lapse_mass(2.0, NOW, "easy", NOW) == pytest.approx(0.5)
+    assert update_lapse_mass(2.0, NOW, "skipped", NOW) == pytest.approx(2.0)
+
+
 def test_queue_score_is_monotonic_for_overdue_and_boost() -> None:
     common = dict(
         now=NOW,

@@ -19,7 +19,9 @@ from .schemas import (
     ProblemDraft,
     ProblemPatch,
     ProblemStatus,
+    ReviewNotes,
     ReviewOutcome,
+    ReviewResponseMarkdown,
     ReviewSheetRequest,
     SearchFilters,
 )
@@ -199,8 +201,8 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         number: str,
         outcome: ReviewOutcome,
         idempotency_key: str,
-        response_markdown: str | None = None,
-        notes: str | None = None,
+        response_markdown: ReviewResponseMarkdown | None = None,
+        notes: ReviewNotes | None = None,
         duration_seconds: int | None = None,
         reviewed_at: datetime | None = None,
     ) -> dict[str, Any]:

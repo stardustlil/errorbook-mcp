@@ -491,8 +491,10 @@ class PdfExporter:
                 )
 
         try:
+            self._cleanup_abandoned_render_files(export_id)
             result = self._render_export(
                 export_id=export_id,
+                lease_token=lease_token,
                 title=request.title,
                 snapshots=snapshots,
                 generated_at=now,
@@ -542,31 +544,36 @@ class PdfExporter:
             "selection": selection_meta,
             **result,
         }
-        with self.service.db.transaction(immediate=True) as connection:
-            updated = connection.execute(
-                """
-                UPDATE exports SET status = 'ready', questions_path = ?, questions_sha256 = ?,
-                    completed_at = ?,
-                    lease_token = NULL, lease_expires_at = NULL
-                WHERE id = ? AND lease_token = ?
-                """,
-                (
-                    result["questions"]["relative_path"],
-                    result["questions"]["sha256"],
-                    iso_utc(utc_now()),
-                    export_id,
-                    lease_token,
-                ),
-            )
-            if not updated.rowcount:
-                return self.get_export(export_id)
-            connection.execute(
-                """
-                UPDATE idempotency_records SET response_json = ?
-                WHERE scope = ? AND key = ?
-                """,
-                (json_dumps(ready_response), scope, idempotency_key),
-            )
+        try:
+            with self.service.db.transaction(immediate=True) as connection:
+                updated = connection.execute(
+                    """
+                    UPDATE exports SET status = 'ready', questions_path = ?, questions_sha256 = ?,
+                        completed_at = ?,
+                        lease_token = NULL, lease_expires_at = NULL
+                    WHERE id = ? AND lease_token = ?
+                    """,
+                    (
+                        result["questions"]["relative_path"],
+                        result["questions"]["sha256"],
+                        iso_utc(utc_now()),
+                        export_id,
+                        lease_token,
+                    ),
+                )
+                if not updated.rowcount:
+                    self._discard_render_result(result)
+                    return self.get_export(export_id)
+                connection.execute(
+                    """
+                    UPDATE idempotency_records SET response_json = ?
+                    WHERE scope = ? AND key = ?
+                    """,
+                    (json_dumps(ready_response), scope, idempotency_key),
+                )
+        except BaseException:
+            self._discard_render_result(result)
+            raise
         return ready_response
 
     def get_export(self, export_id: str) -> dict[str, Any]:
@@ -630,28 +637,39 @@ class PdfExporter:
         return {"ok": True, "items": items, "limit": limit, "offset": offset}
 
     def delete_export(self, export_id: str) -> dict[str, Any]:
-        row = self.service.db.fetch_one(
-            "SELECT id, review_set_id, status, questions_path FROM exports WHERE id = ?",
-            (export_id,),
-        )
-        if row is None:
-            raise NotFoundError(f"Export {export_id} was not found")
-        if row["status"] == "generating":
-            raise ValidationError("A generating export cannot be deleted")
-        if row["questions_path"]:
-            path = self._safe_export_path(row["questions_path"], require_exists=False)
-            path.unlink(missing_ok=True)
-        with self.service.db.transaction(immediate=True) as connection:
-            connection.execute(
-                """
-                DELETE FROM idempotency_records
-                WHERE scope = 'create_review_sheet'
-                  AND json_extract(response_json, '$.export_id') = ?
-                """,
-                (export_id,),
-            )
-            connection.execute("DELETE FROM exports WHERE id = ?", (export_id,))
-            connection.execute("DELETE FROM review_sets WHERE id = ?", (row["review_set_id"],))
+        path: Path | None = None
+        quarantined: Path | None = None
+        try:
+            with self.service.db.transaction(immediate=True) as connection:
+                row = connection.execute(
+                    "SELECT id, review_set_id, status, questions_path FROM exports WHERE id = ?",
+                    (export_id,),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"Export {export_id} was not found")
+                if row["status"] == "generating":
+                    raise ValidationError("A generating export cannot be deleted")
+                if row["questions_path"]:
+                    path = self._safe_export_path(row["questions_path"], require_exists=False)
+                    if path.is_file():
+                        quarantined = self.settings.temp_dir / f"delete-{uuid.uuid4()}.pdf"
+                        os.replace(path, quarantined)
+                connection.execute(
+                    """
+                    DELETE FROM idempotency_records
+                    WHERE scope = 'create_review_sheet'
+                      AND json_extract(response_json, '$.export_id') = ?
+                    """,
+                    (export_id,),
+                )
+                connection.execute("DELETE FROM exports WHERE id = ?", (export_id,))
+                connection.execute("DELETE FROM review_sets WHERE id = ?", (row["review_set_id"],))
+        except BaseException:
+            if quarantined is not None and quarantined.is_file() and path is not None:
+                os.replace(quarantined, path)
+            raise
+        if quarantined is not None:
+            quarantined.unlink(missing_ok=True)
         return {"ok": True, "export_id": export_id, "status": "deleted"}
 
     def read_export(self, export_id: str, booklet: str) -> bytes:
@@ -677,13 +695,14 @@ class PdfExporter:
         self,
         *,
         export_id: str,
+        lease_token: str,
         title: str,
         snapshots: list[dict[str, Any]],
         generated_at: datetime,
     ) -> dict[str, Any]:
         published_paths: list[Path] = []
         try:
-            questions_name = f"{export_id}-questions.pdf"
+            questions_name = f"{export_id}-{lease_token}-questions.pdf"
             questions_relative = f"exports/{questions_name}"
             questions_path = self.settings.data_dir / questions_relative
             questions_html = self._build_html(
@@ -703,6 +722,18 @@ class PdfExporter:
             for published in published_paths:
                 published.unlink(missing_ok=True)
             raise
+
+    def _cleanup_abandoned_render_files(self, export_id: str) -> None:
+        for path in self.settings.exports_dir.glob(f"{export_id}-*-questions.pdf"):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+
+    def _discard_render_result(self, result: dict[str, Any]) -> None:
+        questions = result.get("questions")
+        if not isinstance(questions, dict) or not questions.get("relative_path"):
+            return
+        path = self._safe_export_path(questions["relative_path"], require_exists=False)
+        path.unlink(missing_ok=True)
 
     def _build_html(
         self,
