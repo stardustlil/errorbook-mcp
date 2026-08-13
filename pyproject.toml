@@ -31,7 +31,7 @@ classifiers = [
   "Topic :: Education",
 ]
 dependencies = [
-  "fsrs==6.3.1",
+  "fsrs==6.3.2",
   "latex2mathml>=3.77,<4",
   "markdown-it-py>=3.0,<5",
   "mdit-py-plugins>=0.5,<1",
